@@ -1,12 +1,20 @@
 name: CI Build
 
+# Pushes build only on master: a change on its way there is built by its pull request,
+# against the merge result. Building the branch push as well ran the same build twice and
+# used up a version number each time. Build any branch by hand with workflow_dispatch.
 on:
   push:
     branches:
-      - '**'
+      - master
   pull_request:
     branches:
       - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
 
 jobs:
   build:
@@ -24,19 +32,24 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $year  = (Get-Date).Year
-          $month = (Get-Date).Month
-          $startOfMonth = (Get-Date -Day 1 -Hour 0 -Minute 0 -Second 0).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-
           $headers = @{
             Authorization = "Bearer $env:GITHUB_TOKEN"
             Accept        = "application/vnd.github.v3+json"
           }
-          $url = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/workflows/build.yml/runs?created=>=$startOfMonth&per_page=1"
-          $response = Invoke-RestMethod -Uri $url -Headers $headers -ErrorAction Stop
-          $rev = $response.total_count
+          $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions"
 
-          $version = "1.$year.$month.$rev"
+          # Count this month's runs created up to and including this one. Counting "everything
+          # created so far" gave two runs that overlapped the same number, when the earlier one
+          # queried after the later one had been created.
+          $run = Invoke-RestMethod -Uri "$api/runs/$env:GITHUB_RUN_ID" -Headers $headers -ErrorAction Stop
+          $created = ([DateTime]$run.created_at).ToUniversalTime()
+          $from = [DateTime]::new($created.Year, $created.Month, 1, 0, 0, 0, [DateTimeKind]::Utc)
+          $range = '{0:yyyy-MM-ddTHH:mm:ssZ}..{1:yyyy-MM-ddTHH:mm:ssZ}' -f $from, $created
+          $response = Invoke-RestMethod -Uri "$api/workflows/build.yml/runs?created=$range&per_page=1" -Headers $headers -ErrorAction Stop
+          $rev = $response.total_count
+          if ($rev -lt 1) { throw "Unable to count this month's runs" }
+
+          $version = "1.$($created.Year).$($created.Month).$rev"
           "VERSION=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Computed version: $version"
 
@@ -74,10 +87,25 @@ jobs:
           Write-Host "Patched nuspec to version $version"
 
       - name: NuGet pack
-        run: nuget pack StepManipulationTool.nuspec -OutputDirectory nupkg
+        shell: pwsh
+        run: |
+          nuget pack StepManipulationTool.nuspec -OutputDirectory nupkg -NonInteractive
+          if ($LASTEXITCODE -ne 0) { throw "nuget pack failed with exit code $LASTEXITCODE" }
+
+          # The Plugins folder as XrmToolBox expects it, for testing a build without NuGet
+          $pkg = Get-ChildItem nupkg\*.nupkg | Select-Object -First 1
+          Expand-Archive $pkg.FullName -DestinationPath expanded
+          New-Item -ItemType Directory -Force plugin | Out-Null
+          Move-Item expanded\lib\net48\Plugins plugin\Plugins
 
       - name: Upload nupkg artifact
         uses: actions/upload-artifact@v4
         with:
           name: nupkg-${{ steps.version.outputs.VERSION }}
           path: nupkg/*.nupkg
+
+      - name: Upload plugin files
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-${{ steps.version.outputs.VERSION }}
+          path: plugin/
