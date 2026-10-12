@@ -7,11 +7,49 @@ on:
         description: 'CI run ID whose nupkg artifact to publish (find it in the Actions tab URL)'
         required: true
 
+# Creating the tag and the GitHub release needs write access to contents, and downloading
+# the packages from the CI run needs actions: read. id-token: write lets the job request a
+# GitHub OIDC token, which nuget.org exchanges for a one-hour API key through Trusted
+# Publishing (policy: imranakram/StepsManipulationTool, release.yml).
+permissions:
+  contents: write
+  actions: read
+  id-token: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: windows-latest
+    # The "release" environment only allows master, and the nuget.org Trusted Publishing policy
+    # is bound to it: workflow_dispatch can run this file from any branch, so without it a
+    # modified copy on an unmerged branch could still obtain a NuGet key.
+    environment: release
 
     steps:
+      # Only a successful master build may be published: a pull request build has the same
+      # artifacts, but is built from a merge result that may never reach master
+      - name: Verify CI run
+        id: run
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          if ($env:RUN_ID -notmatch '^\d+$') { throw "run_id must be the numeric ID of a CI Build run" }
+          $run = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:RUN_ID" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Run $env:RUN_ID not found" }
+          Write-Host "Run $($run.id): $($run.path) on $($run.head_branch) ($($run.event)), $($run.conclusion), commit $($run.head_sha)"
+
+          if ($run.path -ne '.github/workflows/build.yml') { throw "Run $env:RUN_ID is not a CI Build run" }
+          if ($run.head_branch -ne 'master' -or $run.event -notin 'push', 'workflow_dispatch') {
+            throw "Only CI Build runs on master can be released (got $($run.event) on $($run.head_branch))"
+          }
+          if ($run.conclusion -ne 'success') { throw "Run $env:RUN_ID did not succeed" }
+          "SHA=$($run.head_sha)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
       - name: Download nupkg artifact from CI run
         uses: actions/download-artifact@v4
         with:
@@ -24,21 +62,45 @@ jobs:
       - name: Resolve version from nupkg filename
         id: version
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $pkg = Get-ChildItem nupkg\*.nupkg | Select-Object -First 1
           if (-not $pkg) { throw "No .nupkg found in artifact" }
           # filename: ImranAkram.XTB.StepManipulationTool.1.2026.4.3.nupkg
           $version = $pkg.BaseName -replace '^ImranAkram\.XTB\.StepManipulationTool\.', ''
+
+          # Stop before NuGet when this build has been released already
+          gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/v$version" --silent 2>$null
+          if ($LASTEXITCODE -eq 0) { throw "Tag v$version already exists" }
+          # "Not found" is the expected answer; don't let gh's exit code end the step as failed
+          $global:LASTEXITCODE = 0
+
           "VERSION=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Releasing version: $version  ($($pkg.Name))"
 
+      # Requested right before the push: the temporary key is only valid for an hour
+      - name: NuGet login (Trusted Publishing)
+        id: nuget-login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      # -SkipDuplicate lets a release be repeated after a later step failed, without NuGet
+      # rejecting the package it already has
       - name: Publish to NuGet.org
-        run: nuget push nupkg\*.nupkg -ApiKey ${{ secrets.NUGET_API_KEY }} -Source https://api.nuget.org/v3/index.json -NonInteractive
+        shell: pwsh
+        env:
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+        run: |
+          nuget push nupkg\*.nupkg -ApiKey $env:NUGET_API_KEY -Source https://api.nuget.org/v3/index.json -SkipDuplicate -NonInteractive
+          if ($LASTEXITCODE -ne 0) { throw "nuget push failed with exit code $LASTEXITCODE" }
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.VERSION }}
+          target_commitish: ${{ steps.run.outputs.SHA }}
           name: Release ${{ steps.version.outputs.VERSION }}
           generate_release_notes: true
           files: nupkg/*.nupkg
